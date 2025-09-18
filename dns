@@ -1,0 +1,271 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math, time
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, RCODE, DNSLabel, DNSQuestion
+
+class Server:
+    def __init__(self, root_ip, domain, port):
+        self.root_ip = root_ip
+        self.domain = domain
+        self.origin = DNSLabel("")
+        try:
+            zone_data = open(domain)
+            self.rrs = RR.fromZone(zone_data)
+        except FileNotFoundError:
+            self.log(f"Error: Zone file '{domain}' not found. Exiting.")
+            sys.exit(1)
+
+        # Socket for client communication
+        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.client_socket.bind(("0.0.0.0", port))
+        self.port = self.client_socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+
+        # Separate socket for upstream DNS server communication (e.g., to root)
+        self.upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        self.dns_cache = []
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, socket, addr, message):
+        self.log(f"Sending to {addr} via socket {socket.getsockname()} :\n{message}")
+        try:
+            socket.sendto(message.pack(), addr)
+        except OSError as e:
+            self.log(f"Error sending to {addr}: {e}")
+
+    def handle_txt_query(self, qname, response):
+        for r in self.rrs:
+            if (qname == r.rname and r.rtype == QTYPE.TXT):
+                response.add_answer(RR(r.rname, QTYPE.TXT, rdata=r.rdata, ttl=r.ttl))
+        return response
+
+    def handle_cname_query(self, request, response):
+        for r in self.rrs:
+            if (qname == r.rname and r.rtype == QTYPE.CNAME):
+                response.add_answer(RR(r.rname, QTYPE.CNAME, rdata=r.rdata, ttl=r.ttl))
+        return response
+
+    def handle_mx_query(self, qname, response):
+        for r in self.rrs:
+            if (qname == r.rname and r.rtype == QTYPE.MX):
+                response.add_answer(RR(r.rname, QTYPE.MX, rdata=r.rdata, ttl=r.ttl))
+        return response
+
+    def handle_ns_query(self, qname, response):
+        for r in self.rrs:
+            if (qname == r.rname and r.rtype == QTYPE.NS):
+                response.add_answer(RR(r.rname, QTYPE.NS, rdata=r.rdata, ttl=r.ttl))
+                response = self.add_a_record(r.rdata.get_label(), response)
+        return response
+
+    def add_a_record(self, qname, response):
+        for r in self.rrs:
+            if qname == r.rname and r.rtype == QTYPE.A:
+                    response.add_ar(RR(r.rname, QTYPE.A, rdata=r.rdata, ttl=r.ttl))
+        return response
+
+    def add_auth_section(self, qname, response):
+        for r in self.rrs:
+            if (qname == r.rname and r.rtype == QTYPE.NS):
+                response.add_auth(RR(r.rname, QTYPE.NS, rdata=r.rdata, ttl=r.ttl))
+        return response
+
+    def make_ns_request(self,  request, response):
+        dns_question = DNSQuestion(request.q.qname, QTYPE.NS)
+        dns_request = DNSRecord(q=dns_question)
+        self.send(self.upstream_socket, (self.root_ip, 60053), dns_request) # Use upstream
+        return []
+
+    def handle_ns_response(self, dns_response, response):
+        if dns_response.q.qtype == QTYPE.NS:
+            if dns_response.header.a:
+                response.add_answer(dns_response.rr[0])
+            if dns_response.header.ar:
+                response.add_ar(dns_response.ar[0])
+            if dns_response.header.auth:
+                response.add_auth(dns_response.auth[0])
+        response.header.aa = 0 # it is not our domain, aa need to be reset
+
+        return response
+
+    def handle_cname_response(self, rr, response):
+        if rr[0].rtype != QTYPE.CNAME:
+            return response
+
+        query = DNSRecord(q=DNSQuestion(rr[0].rdata.get_label(), QTYPE.A))
+        self.send(self.upstream_socket, (self.root_ip, 60053), query)
+
+        # Receive the response using the upstream socket
+        upstream_data, upstream_addr = self.upstream_socket.recvfrom(65535)
+        upstream_response = DNSRecord.parse(upstream_data)
+        self.dns_cache.insert(0, {"time": time.time(), "rr": upstream_response})
+
+        while not upstream_response.header.a: # recursive query until get answer
+            self.send(self.upstream_socket, (str(upstream_response.ar[0].rdata), 60053), query) 
+            # Receive the response using the upstream socket
+            upstream_data, upstream_addr = self.upstream_socket.recvfrom(65535)
+            upstream_response = DNSRecord.parse(upstream_data)
+            self.dns_cache.insert(0, {"time": time.time(), "rr": upstream_response})
+
+        response = self.handle_a_response(upstream_response, response)
+
+        return response
+
+    def handle_a_response(self, dns_response, response):
+        if dns_response.header.a:
+            rr_cname_only = True
+
+            for rr in dns_response.rr:
+                if self.check_domains(dns_response.q.qname, rr.rname):
+                    response.add_answer(rr)
+
+                # if there is a A record, don't go further
+                if rr.rtype == QTYPE.A:
+                    rr_cname_only = False
+                
+            if rr_cname_only:
+                response = self.handle_cname_response(dns_response.rr, response)
+
+        if dns_response.header.ar:
+            for rr in dns_response.ar:
+                response.add_ar(rr)
+        if dns_response.header.auth:
+            for rr in dns_response.auth:
+                response.add_auth(rr)
+
+        return response
+
+    def check_dns_cache(self, request, response):
+        current_time = time.time()
+        dns_response = None
+
+        for cr in self.dns_cache:
+            ttl = cr["rr"].rr[0].ttl if cr["rr"].rr else cr["rr"].ar[0].ttl
+            if current_time - cr["time"] > ttl: # remove the entry if it is expired
+                self.dns_cache.remove(cr)
+            else:
+                if not dns_response and cr["rr"].q.qname == request.q.qname:
+                    dns_response = cr["rr"]
+
+        return dns_response
+
+    def handle_a_query(self, qname, response):
+        print(qname)
+        if qname.matchSuffix(self.origin):
+            response = self.add_auth_section(self.origin, response)
+            for r in self.rrs:
+                if qname == r.rname:
+                    if r.rtype == QTYPE.A:
+                        response.add_answer(RR(r.rname, QTYPE.A, rdata=r.rdata, ttl=r.ttl))
+                    elif r.rtype == QTYPE.CNAME:
+                        response.add_answer(RR(r.rname, QTYPE.CNAME, rdata=r.rdata, ttl=r.ttl))
+                        if r.rdata.get_label().matchSuffix(self.origin):
+                            response = self.handle_a_query(r.rdata.get_label(), response)
+        else:  # not in our domain,  RECURSIVE behavior
+            request = self.make_ns_request(self, qname)
+
+        if len(response.rr) == 0:
+            response.header.rcode = RCODE.NXDOMAIN
+
+        return response
+
+    def check_domains(self, qname, rname):
+        qlabels = list(qname.label)  # Get the labels as a list
+        rlabels = list(rname.label)
+
+        if len(rlabels) >= 1:
+            qdomain = qlabels[len(qlabels) - 1]
+            rdomain = rlabels[len(rlabels) - 1]
+            subdomains = rlabels[len(rlabels) - 2]  # Get all subdomains
+            if qdomain != rdomain:
+                return False
+       
+        return True
+    
+    def recv(self, socket):
+        data, addr = socket.recvfrom(65535)
+        request = DNSRecord.parse(data)
+        self.log(f"Received from {addr} on socket {socket.getsockname()}:\n{request}")
+
+        response = request.reply() # start building response
+
+        if request.q.qname.matchSuffix(self.origin):  # Local query
+            if request.q.qtype == QTYPE.NS:
+                response = self.handle_ns_query(request.q.qname, response)
+            elif request.q.qtype == QTYPE.A:
+                response = self.handle_a_query(request.q.qname, response)
+            elif request.q.qtype == QTYPE.CNAME:
+                response = self.handle_cname_query(request.q.qname, response)
+            elif request.q.qtype == QTYPE.MX:
+                response = self.handle_mx_query(request.q.qname, response)
+            elif request.q.qtype == QTYPE.TXT:
+                response = self.handle_txt_query(request.q.qname, response)
+            elif request.q.qtype == QTYPE.AAAA:
+                response = self.handle_a_query(request.q.qname, response)
+            self.send(self.client_socket, addr, response)  # Respond to client
+        else:  # External query - forward and handle response
+            cache_found = False
+            upstream_response = self.check_dns_cache(request, response)
+            if upstream_response:
+                cache_found = True
+            else:
+                self.send(self.upstream_socket, (self.root_ip, 60053), request) 
+                # Receive the response using the upstream socket
+                upstream_data, upstream_addr = self.upstream_socket.recvfrom(65535)
+                upstream_response = DNSRecord.parse(upstream_data)
+                self.log(f"Received from upstream {upstream_addr}:\n{upstream_response}")
+                self.dns_cache.insert(0, {"time": time.time(), "rr": upstream_response})
+
+                if upstream_response.header.rcode != RCODE.NOERROR:
+                    self.log(f"Received error from upstream {upstream_addr}:\n{upstream_response}")
+
+            if request.q.qtype == QTYPE.NS:
+                response = self.handle_ns_response(upstream_response, response) # process
+            elif request.q.qtype == QTYPE.A or request.q.qtype == QTYPE.MX or request.q.qtype == QTYPE.TXT or request.q.qtype == QTYPE.AAAA:
+                good_response = True
+                while not upstream_response.header.a: # recursive query until get answer
+                    if not self.check_domains(request.q.qname, upstream_response.ar[0].rname):
+                        good_response = False
+                        break
+
+                    self.send(self.upstream_socket, (str(upstream_response.ar[0].rdata), 60053), request) 
+                    # Receive the response using the upstream socket
+                    upstream_data, upstream_addr = self.upstream_socket.recvfrom(65535)
+                    upstream_response = DNSRecord.parse(upstream_data)
+                    self.log(f"Received from upstream {upstream_addr}:\n{upstream_response}")
+
+                    if not cache_found:
+                        self.dns_cache.insert(0, {"time": time.time(), "rr": upstream_response})
+                    #print(f"Current cache: {self.dns_cache}") # added for debugging
+                if good_response:
+                    response = self.handle_a_response(upstream_response, response)
+                response.header.aa = 0 # it is not our domain, aa need to set reset
+
+            self.send(self.client_socket, addr, response)  # Respond to client
+
+    def run(self):
+        seq = 0
+        for rr in self.rrs:
+            print(rr)
+            if (rr.rtype == QTYPE.SOA):
+                self.origin = rr.rname
+
+        while True:
+            socks = select.select([self.client_socket], [], [], 0.1)[0]
+            for conn in socks:
+                self.recv(conn)
+
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('root_ip', type=str, help="The IP address of the root server")
+    parser.add_argument('zone', type=str, help="The zone file for this server")
+    parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
+    args = parser.parse_args()
+    sender = Server(args.root_ip, args.zone, args.port)
+    sender.run()
